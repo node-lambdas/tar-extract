@@ -1,8 +1,12 @@
 {
-  "name": "@node-lambdas/echo",
+  "name": "@node-lambdas/tar-extract",
   "version": "1.0.0",
   "type": "module",
   "publishConfig": {
     "access": "public"
+  },
+  "dependencies": {
+    "glob-to-regexp": "^0.4.1",
+    "tar-stream": "^2.1.4"
   }
 }

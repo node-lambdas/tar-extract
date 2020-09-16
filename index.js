@@ -1,35 +1,104 @@
-import { lambda, fetch, Console, Format } from '@node-lambdas/core';
+import { lambda } from '@node-lambdas/core';
+import { Console } from 'console';
+import * as GlobToRegExp from 'glob-to-regexp';
+import * as TarStream from 'tar-stream';
+import { createUnzip } from 'zlib';
 
-const zipUrl = (repo) => `https://codeload.github.com/${repo}/zip/master`;
-const tarUrl = (repo) => `https://codeload.github.com/${repo}/legacy.tar.gz/master`;
-const MACOS_CHROME =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/83.0.4103.116 Safari/537.36';
+const { extract } = TarStream.default;
+const globToRegExp = GlobToRegExp.default;
 
-async function handle(url, output) {
-  Console.log('GET', url);
+function getMatcher(input) {
+  let matcher = () => true;
 
-  try {
-    const response = await fetch(url, { headers: { 'User-Agent': MACOS_CHROME } });
-    response.pipe(output);
-  } catch (error) {
-    Console.error(error);
-    output.reject(error.message);
+  if (input.options.patterns) {
+    const patterns = input.options.patterns.split(',').map((pattern) => globToRegExp(pattern));
+    matcher = (file) => patterns.some((pattern) => pattern.test(file));
   }
+
+  if (input.options.extensions) {
+    const extensions = input.options.extensions.split(',');
+    matcher = (file) => extensions.some((extension) => file.endsWith('.' + extension));
+  }
+
+  return matcher;
+}
+
+function escapeDoubleQuotes(string) {
+  return string.replace(/"/g, '\\"');
 }
 
 export default lambda({
   version: 2,
   actions: {
-    zip: {
+    extract: {
       default: true,
-      input: Format.Text,
-      description: 'Download a GitHub repository as a zip file.\nInput has the format of "org/repo"',
-      handler: (input, output) => handle(zipUrl(input.body), output),
-    },
-    tar: {
-      input: Format.Text,
-      description: 'Download a GitHub repository as a tarball (.tgz) file.\nInput has the format of "org/repo"',
-      handler: (input, output) => handle(tarUrl(input.body), output),
+      options: {
+        patterns: 'string',
+        extension: 'string',
+      },
+      description: [
+        'Extract files from a tar stream and output the results as a JSON array',
+        'The file content will be converted to a hexadecimal string.',
+        'Each entry has name, size, and content (if --content option is provided).',
+        'Filter by extensions (e.g. --extensions=md,js,html) or with file match patterns (e.g. --patterns="**/*.txt,**/*.md")',
+      ].join('\n'),
+
+      handler: (input, output) => {
+        const withContent = input.options.content;
+        output.write('[');
+
+        const onError = (error) => {
+          Console.error(error);
+          output.reject(error);
+        };
+
+        const matcher = getMatcher(input);
+        const pushHex = (buffer) => output.write(buffer.toString('hex'));
+        const stream = extract();
+        let isFirst = true;
+
+        stream.on('entry', async (header, body, next) => {
+          const resume = () => {
+            body.on('end', () => next());
+            body.resume();
+          };
+
+          const { type, name, size } = header;
+
+          if (type !== 'file' || !matcher(name)) {
+            resume();
+            return;
+          }
+
+          if (!isFirst) {
+            output.write(',\n');
+          }
+
+          output.write('{\n  "name": "' + escapeDoubleQuotes(name) + '",\n  "size": ' + size);
+
+          if (withContent) {
+            output.write(',\n  "content": "');
+
+            body.on('error', onError);
+            body.on('data', pushHex);
+            body.on('end', (chunk) => {
+              chunk && pushHex(chunk);
+              output.write('"\n}');
+              next();
+            });
+          } else {
+            output.write('\n}');
+            resume();
+          }
+
+          isFirst = false;
+        });
+
+        stream.on('finish', () => output.end(']'));
+        stream.on('error', onError);
+
+        input.pipe(createUnzip()).pipe(stream);
+      },
     },
   },
 });
